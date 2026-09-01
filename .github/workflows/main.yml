@@ -5,7 +5,6 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
   schedule:
-    # يعيد تشغيل نفسه كل 5 ساعات لتجنب حد الـ 6 ساعات
     - cron: '0 */5 * * *'
 
 jobs:
@@ -24,13 +23,9 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install yt-dlp
+        pip install yt-dlp requests pyTelegramBotAPI
 
     - name: Start Bot
       run: |
-        # تشغيل البوت في الخلفية
         python3 bot.py &
-        
-        # يبقي الجلسة شحالة لمدة 5 ساعات و 50 دقيقة ثم تعيد الجلسة نفسها
         sleep 21000
