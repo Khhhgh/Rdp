@@ -1,58 +1,113 @@
-name: setup KDE Plasma + Tailscale + xrdp
+name: Windows RDP via dockur-windows + Tailscale
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_version:
+        description: 'Select Windows version'
+        required: true
+        default: 'ltsc10'   # Fastest, lightweight version (default)
+        type: choice
+        options:
+          - win11
+          - win10
+          - ltsc10
+          - win7
+          - winxp
+          - 2022 (Server)
+          - 2019 (Server)
+          - 2016 (Server)
+          - 2012 (Server)
+          - 2008 (Server)
 
 permissions:
   contents: read
 
 jobs:
-  setup-gui-runner:
+  windows-vm:
     runs-on: ubuntu-latest
     env:
       TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-      USERNAME: runner
-      PASSWORD: runner
-      TAILSCALE_HOSTNAME: gh-plasma-xrdp-${{ github.run_id }}
+      TAILSCALE_HOSTNAME: win-vm-${{ github.run_id }}
+      WINDOWS_VERSION: ${{ github.event.inputs.windows_version || 'ltsc10' }}
+      RDP_PORT: 3389
+      WEB_PORT: 8006
+
+    # Uncomment the line below if using a self-hosted runner
+    # runs-on: self-hosted
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Ensure runner user has sudo
+      - name: Check KVM support
         run: |
-          echo "${USERNAME}:${PASSWORD}" | sudo chpasswd
-          echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/${USERNAME}
+          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "✅ KVM support available"
+            echo "KVM_OPTION=" >> $GITHUB_ENV
+          else
+            echo "⚠️ KVM not available (performance will be lower)"
+            echo "KVM_OPTION=-e KVM=N" >> $GITHUB_ENV
+          fi
 
-      - name: Install KDE Plasma + xrdp
+      # Critical fix: give read/write permission to the KVM device
+      - name: Fix KVM permissions
+        run: sudo chmod 666 /dev/kvm
+
+      - name: Install Docker
         run: |
-          echo ">>> Installing KDE Plasma Desktop..."
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq kde-plasma-desktop xorg dbus-x11 xrdp
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo usermod -aG docker $USER
+          sudo systemctl start docker
 
-          echo "startplasma-x11" | sudo tee /home/${USERNAME}/.xsession
-          echo "exec startplasma-x11" | sudo tee /home/${USERNAME}/.xinitrc
-          sudo chown ${USERNAME}:${USERNAME} /home/${USERNAME}/.xsession /home/${USERNAME}/.xinitrc
-
-          sudo systemctl enable --now xrdp
-          sudo systemctl restart xrdp
-
-      - name: Install Tailscale
+      - name: Install Tailscale and connect
         run: |
-          echo ">>> Installing Tailscale..."
-          curl -fsSL https://tailscale.com/install.sh | sudo sh >/dev/null 2>&1
+          curl -fsSL https://tailscale.com/install.sh | sudo sh
           sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
-          sudo tailscale ip -4
 
-      - name: Connection + Keep Alive
+      # Launch container with CPU and RAM limits
+      - name: Launch dockur-windows container
         run: |
-          echo "=== FINAL CONNECTION INFO ==="
-          echo "USERNAME: ${USERNAME}"
-          echo "PASSWORD: ${PASSWORD}"
-          echo "Tailscale IPs:"
-          sudo tailscale ip -4 || true
-          echo "Connect with any RDP client using the IP above."
-          echo
-          echo "This method is provided by @MR_English2008 on Telegram."
-          echo "For more methods, join: https://t.me/ME2008_RDP"
-          echo ">>> Keeping runner alive."
-          while true; do sleep 600; done
+          docker run -d \
+            --name windows \
+            --device=/dev/kvm \
+            --cap-add NET_ADMIN \
+            --stop-timeout 120 \
+            --cpus="2" --memory="4g" \
+            -p ${RDP_PORT}:3389/tcp \
+            -p ${RDP_PORT}:3389/udp \
+            -p ${WEB_PORT}:8006 \
+            -e VERSION="${WINDOWS_VERSION}" \
+            ${KVM_OPTION} \
+            dockurr/windows
+
+      - name: Wait for Windows installation to complete
+        run: |
+          echo "Windows is being installed (may take 10-20 minutes)..."
+          for i in {1..60}; do
+            if docker logs windows 2>&1 | grep -q "Windows is ready"; then
+              echo "✅ Windows installation successful!"
+              break
+            fi
+            sleep 20
+            echo "Attempt $i/60: Still installing..."
+            if [ $i -eq 60 ]; then
+              echo "⚠️ Timeout reached, check logs:"
+              docker logs windows --tail 30
+            fi
+          done
+
+      - name: Show connection information
+        run: |
+          TS_IP=$(tailscale ip -4 | head -n1)
+          echo "============================================================"
+          echo "        WINDOWS VM + TAILSCALE CONNECTION INFO              "
+          echo "============================================================"
+          echo "RDP address (via Tailscale): ${TS_IP}:${RDP_PORT}"
+          echo "Username: Docker"
+          echo "Password: (leave blank - set later)"
+          echo ""
+          echo "Web Viewer (via Tailscale): http://${TS_IP}:${WEB_PORT}"
+          echo ""
+          echo "Important: After connecting via RDP, set a Windows password."
+          echo "============================================================"
+
+      - name: Keep Alive (keep running for 6 hours)
+        run: while true; do sleep 600; done   # 600 = 10 minutes; change to 120 if desired
