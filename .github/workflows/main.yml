@@ -1,113 +1,133 @@
-name: Windows RDP via dockur-windows + Tailscale
+name: win 11 + tailscale + Download.bat script 
 
 on:
   workflow_dispatch:
-    inputs:
-      windows_version:
-        description: 'Select Windows version'
-        required: true
-        default: 'ltsc10'   # Fastest, lightweight version (default)
-        type: choice
-        options:
-          - win11
-          - win10
-          - ltsc10
-          - win7
-          - winxp
-          - 2022 (Server)
-          - 2019 (Server)
-          - 2016 (Server)
-          - 2012 (Server)
-          - 2008 (Server)
-
-permissions:
-  contents: read
 
 jobs:
-  windows-vm:
-    runs-on: ubuntu-latest
-    env:
-      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-      TAILSCALE_HOSTNAME: win-vm-${{ github.run_id }}
-      WINDOWS_VERSION: ${{ github.event.inputs.windows_version || 'ltsc10' }}
-      RDP_PORT: 3389
-      WEB_PORT: 8006
-
-    # Uncomment the line below if using a self-hosted runner
-    # runs-on: self-hosted
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
 
     steps:
-      - name: Check KVM support
+      - name: Configure Core RDP Settings
         run: |
-          if [ -e /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            echo "✅ KVM support available"
-            echo "KVM_OPTION=" >> $GITHUB_ENV
-          else
-            echo "⚠️ KVM not available (performance will be lower)"
-            echo "KVM_OPTION=-e KVM=N" >> $GITHUB_ENV
-          fi
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-      # Critical fix: give read/write permission to the KVM device
-      - name: Fix KVM permissions
-        run: sudo chmod 666 /dev/kvm
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+         
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-      - name: Install Docker
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
         run: |
-          curl -fsSL https://get.docker.com | sudo sh
-          sudo usermod -aG docker $USER
-          sudo systemctl start docker
+          $password = "MR.English2008"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+         
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+         
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
-      - name: Install Tailscale and connect
+      - name: Install Tailscale
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sudo sh
-          sudo tailscale up --authkey "${TAILSCALE_AUTHKEY}" --hostname "${TAILSCALE_HOSTNAME}"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+         
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      # Launch container with CPU and RAM limits
-      - name: Launch dockur-windows container
+      - name: Establish Tailscale Connection
         run: |
-          docker run -d \
-            --name windows \
-            --device=/dev/kvm \
-            --cap-add NET_ADMIN \
-            --stop-timeout 120 \
-            --cpus="2" --memory="4g" \
-            -p ${RDP_PORT}:3389/tcp \
-            -p ${RDP_PORT}:3389/udp \
-            -p ${WEB_PORT}:8006 \
-            -e VERSION="${WINDOWS_VERSION}" \
-            ${KVM_OPTION} \
-            dockurr/windows
-
-      - name: Wait for Windows installation to complete
+          # Bring up Tailscale with the provided auth key and set a unique hostname
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+         
+          # Wait for Tailscale to assign an IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+         
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+     
+      - name: Verify RDP Accessibility
         run: |
-          echo "Windows is being installed (may take 10-20 minutes)..."
-          for i in {1..60}; do
-            if docker logs windows 2>&1 | grep -q "Windows is ready"; then
-              echo "✅ Windows installation successful!"
-              break
-            fi
-            sleep 20
-            echo "Attempt $i/60: Still installing..."
-            if [ $i -eq 60 ]; then
-              echo "⚠️ Timeout reached, check logs:"
-              docker logs windows --tail 30
-            fi
-          done
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+         
+          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-      - name: Show connection information
+      - name: Maintain Connection + Watch RDP User
         run: |
-          TS_IP=$(tailscale ip -4 | head -n1)
-          echo "============================================================"
-          echo "        WINDOWS VM + TAILSCALE CONNECTION INFO              "
-          echo "============================================================"
-          echo "RDP address (via Tailscale): ${TS_IP}:${RDP_PORT}"
-          echo "Username: Docker"
-          echo "Password: (leave blank - set later)"
-          echo ""
-          echo "Web Viewer (via Tailscale): http://${TS_IP}:${WEB_PORT}"
-          echo ""
-          echo "Important: After connecting via RDP, set a Windows password."
-          echo "============================================================"
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
 
-      - name: Keep Alive (keep running for 6 hours)
-        run: while true; do sleep 600; done   # 600 = 10 minutes; change to 120 if desired
+          $rdpProfile = "C:\Users\RDP"
+          $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $downloadPath = "$startupPath\Downloads.bat"
+
+          while ($true) {
+              if (Test-Path $rdpProfile) {
+                  try {
+                      if (-not (Test-Path $startupPath)) {
+                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+                      }
+
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+                      Write-Host "✅ Downloads.bat copied to $downloadPath"
+
+                      # Run the batch file for the first time
+                      cmd /c $downloadPath
+                      Write-Host "✅ Downloads.bat executed successfully"
+                      break
+                  }
+                  catch {
+                      Write-Host "❌ Error copying or executing Downloads.bat: $($_.Exception.Message)"
+                      break
+                  }
+              }
+              else {
+                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+          # Keep runner alive
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
