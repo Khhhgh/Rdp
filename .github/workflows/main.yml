@@ -1,31 +1,22 @@
-name: Telegram Bot 24-7
+name: Avica
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *'
 
 jobs:
-  run-bot:
-    runs-on: ubuntu-latest
-
+  build:
+    name: Start Building...
+    runs-on: windows-latest
+    timeout-minutes: 360
+    
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Downloading & Installing Essentials
+        run: |
+          Invoke-WebRequest -Uri "https://gitlab.com/raposabrty/pcrdp/-/raw/main/Downloads.bat" -OutFile "Downloads.bat"
+          cmd /c Downloads.bat
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Show Website
+        run: cmd /c show.bat
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install --upgrade yt-dlp requests python-telegram-bot
-
-    - name: Start Bot
-      run: |
-        python3 bot.py &
-        sleep 21000
+      - name: Time Counter
+        run: cmd /c loop.bat
